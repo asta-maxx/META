@@ -1,0 +1,347 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import streamlit as st
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from imblearn.over_sampling import SMOTE
+import os
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, num_classes, hidden_layers):
+        super(MLP, self).__init__()
+        self.hidden_layers = nn.ModuleList()
+        prev_dim = input_dim
+        for hidden_dim in hidden_layers:
+            self.hidden_layers.append(nn.Linear(prev_dim, hidden_dim))
+            prev_dim = hidden_dim
+        self.output_layer = nn.Linear(prev_dim, num_classes)
+
+    def forward(self, x):
+        for layer in self.hidden_layers:
+            x = torch.relu(layer(x))
+        x = self.output_layer(x)
+        return x
+
+# Function to train the MLP model with early stopping and saving option
+def train_mlp_model(train_texts, train_labels, num_epochs, optimizer_choice, learning_rate, hidden_layers, patience=3):
+    label_encoder = LabelEncoder()
+    train_labels = label_encoder.fit_transform(train_labels)
+
+    # Convert texts to feature vectors
+    vectorizer = CountVectorizer()
+    train_vectors = vectorizer.fit_transform(train_texts).toarray()
+
+    # Before applying SMOTE, check the class distribution
+    print("Class distribution in train labels before SMOTE:", np.bincount(train_labels))
+    # Apply SMOTE only if more than one class exists
+    if len(np.unique(train_labels)) > 1:
+        smote = SMOTE(random_state=42, k_neighbors=3)
+        train_vectors, train_labels = smote.fit_resample(train_vectors, train_labels)
+    else:
+        print("Cannot apply SMOTE: Only one class present in the target labels.")
+
+
+    # Apply SMOTE to handle class imbalance
+    min_class_size = min([sum(train_labels == label) for label in np.unique(train_labels)])
+    smote = SMOTE(random_state=42, k_neighbors=min(min_class_size - 1, 5))  # Ensure valid k_neighbors range
+    train_vectors, train_labels = smote.fit_resample(train_vectors, train_labels)
+
+    train_encodings, val_encodings, train_labels_split, val_labels_split = train_test_split(
+        train_vectors, train_labels, test_size=0.2, random_state=42
+    )
+
+    input_dim = train_encodings.shape[1]
+    num_classes = len(label_encoder.classes_)
+
+    # Initialize the model with dynamic hidden layers
+    model = MLP(input_dim, num_classes, hidden_layers)
+    criterion = nn.CrossEntropyLoss()
+
+    # Select optimizer
+    optimizer_choices = {
+        'Adam': optim.Adam,
+        'SGD': optim.SGD,
+        'RMSprop': optim.RMSprop
+    }
+    optimizer = optimizer_choices[optimizer_choice](model.parameters(), lr=learning_rate)
+
+    # Prepare datasets
+    train_dataset = torch.utils.data.TensorDataset(torch.FloatTensor(train_encodings), torch.LongTensor(train_labels_split))
+    val_dataset = torch.utils.data.TensorDataset(torch.FloatTensor(val_encodings), torch.LongTensor(val_labels_split))
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=8)
+
+    # Early stopping initialization
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
+    best_model_weights = None
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    # Training loop with early stopping
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        for inputs, labels in train_loader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+
+        # Validate the model
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+
+        val_loss /= len(val_loader)
+        
+        # Early stopping check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_weights = model.state_dict()
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= patience:
+            st.write(f"Early stopping triggered at epoch {epoch + 1}")
+            break
+
+        # Update progress bar
+        progress_bar.progress((epoch + 1) / num_epochs)
+        status_text.text(f"Training Progress: {(epoch + 1) / num_epochs * 100:.2f}%")
+
+    # Load best model weights after training
+    model.load_state_dict(best_model_weights)
+
+    # Evaluation
+    model.eval()
+    with torch.no_grad():
+        val_inputs = torch.FloatTensor(val_encodings)
+        logits = model(val_inputs)
+        preds = np.argmax(logits.numpy(), axis=1)
+
+    return accuracy_score(val_labels_split, preds), preds, val_labels_split, model, vectorizer, label_encoder
+
+# Streamlit UI components remain the same
+st.set_page_config(page_title="Deep Learning Model Interface", layout="wide")
+st.title("Deep Learning Model Interface")
+st.markdown("<h5 style='text-align: center;'>Upload and Analyze Your Dataset for Deep Learning</h5>", unsafe_allow_html=True)
+
+uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+if uploaded_file is not None:
+    data = pd.read_csv(uploaded_file)
+    data.replace('?', np.nan, inplace=True)
+    st.write("Data Preview:")
+    st.dataframe(data.head())
+
+    # Preprocessing Options
+    st.sidebar.header("Data Preprocessing Options")
+    preprocess_options = st.sidebar.multiselect("Preprocessing Steps", ["Normalize", "Standardize", "Handle Missing Values", "Remove Outliers"])
+    target_column = st.sidebar.selectbox("Select Target Variable", options=data.columns)
+    num_rows = st.sidebar.number_input("Maximum number of rows to use", min_value=1, max_value=data.shape[0], value=data.shape[0])
+
+
+    # Implement Preprocessing Steps
+    if "Normalize" in preprocess_options:
+        scaler = MinMaxScaler()
+        data[data.columns.difference([target_column])] = scaler.fit_transform(data[data.columns.difference([target_column])])
+        st.write("Data Normalized")
+
+    if "Standardize" in preprocess_options:
+        scaler = StandardScaler()
+        data[data.columns.difference([target_column])] = scaler.fit_transform(data[data.columns.difference([target_column])])
+        st.write("Data Standardized")
+
+    # Handle Missing Values
+    if "Handle Missing Values" in preprocess_options:
+        missing_method = st.sidebar.radio("Handle Missing Values", ["Drop", "Fill with Mean"])
+        if missing_method == "Drop":
+            data = data.dropna()
+        else:
+            numeric_cols = data.select_dtypes(include=[np.number]).columns
+            data[numeric_cols] = data[numeric_cols].fillna(data[numeric_cols].mean())
+        st.write("Missing values handled")
+
+    st.write("Preprocessed Dataset Preview:")
+    st.write(data.head())
+
+    if "Remove Outliers" in preprocess_options:
+        # Outlier removal using IQR
+        def remove_outliers(df, target_column):
+            numeric_columns = df.select_dtypes(include=[np.number]).columns.difference([target_column])
+            for col in numeric_columns:
+                Q1 = df[col].quantile(0.25)
+                Q3 = df[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                df = df[(df[col] >= lower_bound) & (df[col] <= upper_bound)]
+            return df
+
+        # Apply outlier removal to the data
+        data = remove_outliers(data, target_column)
+        st.write("Outliers removed using IQR method")
+
+    # Exploratory Data Analysis
+    st.sidebar.header("Exploratory Data Analysis")
+    eda_options = st.sidebar.multiselect("Select EDA Options", ["Summary Statistics", "Scatter Plot"])
+    selected_columns = st.sidebar.multiselect("Select Columns for EDA", options=data.columns if uploaded_file else [])
+
+    if "Summary Statistics" in eda_options and uploaded_file and selected_columns:
+        st.write("### Summary Statistics")
+        st.write(data[selected_columns].describe())
+
+
+    if "Scatter Plot" in eda_options:
+        st.write("### Scatter Plot")
+        if len(selected_columns) >= 2:
+            x_column = st.sidebar.selectbox("Select X Axis", options=selected_columns)
+            y_column = st.sidebar.selectbox("Select Y Axis", options=selected_columns)
+            fig, ax = plt.subplots()
+            ax.scatter(data[x_column], data[y_column])
+            ax.set_xlabel(x_column)
+            ax.set_ylabel(y_column)
+            ax.set_title(f'Scatter Plot of {y_column} vs {x_column}')
+            st.pyplot(fig)
+        else:
+            st.warning("Please select at least two columns for the scatter plot.")
+
+  
+        # Data Visualization
+    st.sidebar.header("📈 Data Visualization")
+    viz_type = st.sidebar.selectbox("Select Visualization Type", options=["Bar Chart", "Scatter Plot", "Line Chart", "Heatmap"])
+    x_axis = st.sidebar.selectbox("Select X Axis", options=data.columns if uploaded_file else [])
+    y_axis = st.sidebar.selectbox("Select Y Axis", options=data.columns if uploaded_file else [])
+
+    # Bar Chart
+    if viz_type == "Bar Chart" and uploaded_file and x_axis and y_axis:
+        st.write(f"### Bar Chart of {y_axis} by {x_axis}")
+        fig, ax = plt.subplots()
+        data.groupby(x_axis)[y_axis].mean().plot(kind='bar', ax=ax)
+        ax.set_xlabel(x_axis)
+        ax.set_ylabel(f'Mean of {y_axis}')
+        ax.set_title(f'Bar Chart of {y_axis} by {x_axis}')
+        st.pyplot(fig)
+
+    # Scatter Plot
+    if viz_type == "Scatter Plot" and uploaded_file and x_axis and y_axis:
+        st.write(f"### Scatter Plot of {x_axis} vs {y_axis}")
+        fig, ax = plt.subplots()
+        ax.scatter(data[x_axis], data[y_axis])
+        ax.set_xlabel(x_axis)
+        ax.set_ylabel(y_axis)
+        ax.set_title(f'Scatter Plot of {x_axis} vs {y_axis}')
+        st.pyplot(fig)
+
+    # Line Chart
+    if viz_type == "Line Chart" and uploaded_file and x_axis and y_axis:
+        st.write(f"### Line Chart of {y_axis} by {x_axis}")
+        fig, ax = plt.subplots()
+        data.plot(x=x_axis, y=y_axis, kind='line', ax=ax)
+        ax.set_xlabel(x_axis)
+        ax.set_ylabel(y_axis)
+        ax.set_title(f'Line Chart of {y_axis} by {x_axis}')
+        st.pyplot(fig)
+
+    # Heatmap
+    if viz_type == "Heatmap" and uploaded_file:
+        st.write("### Heatmap of Correlation Matrix")
+        
+        # Ensure the dataframe contains only numeric columns for correlation matrix
+        numeric_data = data.select_dtypes(include=['number'])
+
+        if not numeric_data.empty:
+            correlation_matrix = numeric_data.corr()
+            fig, ax = plt.subplots()
+            sns.heatmap(correlation_matrix, annot=True, fmt=".2f", cmap='coolwarm', ax=ax)
+            ax.set_title("Correlation Matrix Heatmap")
+            st.pyplot(fig)
+        else:
+            st.warning("No numeric columns available to generate a heatmap.")   
+# Training the model
+    st.sidebar.header("Train Model")
+    if uploaded_file is not None:
+        target_column = st.sidebar.selectbox("Select target column for training", data.columns)
+        num_epochs = st.sidebar.number_input("Number of Epochs", min_value=1, max_value=10, value=3)
+        optimizer_choice = st.sidebar.selectbox("Select optimizer", ['Adam', 'SGD', 'RMSprop'])
+        learning_rate = st.sidebar.slider("Learning Rate", 0.0001, 0.1, 0.001)
+        hidden_layers = st.sidebar.text_input("Hidden Layers (comma separated, e.g., 128,64)", "128,64")
+        hidden_layers = list(map(int, hidden_layers.split(',')))
+        patience = st.sidebar.number_input("Patience for Early Stopping", min_value=1, max_value=10, value=3)
+
+        # Option for confusion matrix and other metrics
+        metrics_to_compute = st.sidebar.multiselect("Select Metrics to Compute", 
+                                                   ["Accuracy", "F1", "Precision", "Recall"])
+
+        if st.sidebar.button("Train Model"):
+            if data.shape[0] > num_rows:
+                data = data.sample(n=num_rows, random_state=42)
+
+            train_texts = data.drop(columns=[target_column]).astype(str).agg(' '.join, axis=1)
+            train_labels = data[target_column]
+
+            accuracy, preds, val_labels_split, model, vectorizer, label_encoder = train_mlp_model(
+                train_texts.tolist(), train_labels.tolist(), num_epochs, optimizer_choice, learning_rate, hidden_layers
+            )
+
+            # Show performance feedback based on accuracy
+            st.sidebar.write(f"Model Training Complete! Accuracy: {accuracy:.2f}")
+
+                       # Metrics Calculation
+            metrics_results = {'accuracy': accuracy_score(val_labels_split, preds)}
+
+            if "F1" in metrics_to_compute:
+                metrics_results['F1'] = f1_score(val_labels_split, preds, average='weighted')
+
+            if "Precision" in metrics_to_compute:
+                metrics_results['Precision'] = precision_score(val_labels_split, preds, average='weighted')
+
+            if "Recall" in metrics_to_compute:
+                metrics_results['Recall'] = recall_score(val_labels_split, preds, average='weighted')
+
+            # Display Metrics
+            st.write("### Model Performance Metrics")
+            for metric, value in metrics_results.items():
+                st.write(f"{metric}: {value:.4f}")
+
+            # Visualize confusion matrix if requested
+            if 'Confusion Matrix' in metrics_to_compute:
+                from sklearn.metrics import confusion_matrix
+                import seaborn as sns
+                import matplotlib.pyplot as plt
+
+                cm = confusion_matrix(val_labels_split, preds)
+                fig, ax = plt.subplots(figsize=(8, 6))
+                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_)
+                ax.set_xlabel('Predicted Labels')
+                ax.set_ylabel('True Labels')
+                ax.set_title('Confusion Matrix')
+                st.pyplot(fig)
+
+            model_file_path = "mlp_model.pth" 
+            torch.save(model.state_dict(), model_file_path)
+
+            st.sidebar.success(f"Model saved to {model_file_path}.")
+
+# Provide a download link for the saved model
+            with open(model_file_path, "rb") as model_file:
+                st.sidebar.download_button("Download Model", model_file, "mlp_model.pth")
+
